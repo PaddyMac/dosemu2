@@ -509,6 +509,66 @@ done:
 }
 
 /*****************************
+ * BuildCDSInDOS
+ * on entry:
+ *   dosdrive: Dos Drive number (0=A, 1=B etc)
+ *   fromdrive: Dos Drive number to build CDS from
+ *   cds: For the result
+ * on exit:
+ *   Returns 1 on success, 0 on fail
+ * notes:
+ *   This function can be used only whilst InDOS, in essence that means from
+ *   redirector int2f/11 function. It relies on being able to run int2f/12
+ *   functions which need to use the DOS stack.
+ *****************************/
+static int BuildCDSInDOS(uint8_t dosdrive, uint8_t fromdrive, cds_t cds)
+{
+  unsigned int ssp, sp;
+  int ret = 0;
+  struct vm86_regs saved_regs = REGS;
+
+  ssp = SEGOFF2LINEAR(_SS, 0);
+  sp = _SP;
+  pushw(ssp, sp, (uint16_t)fromdrive + 'A');
+  _SP -= 2;
+  _AX = 0x121f;
+  do_int_call_back(0x2f);
+  _SP += 2;
+
+  if (!isset_CF()) {
+    /* PC-DOS returns the same buffer that was previously returned
+     * by 1217, no matter what drive letter you pass to 121f!
+     * But if with 1217 you got the CDS for uninitialized drive,
+     * then 121f will use the buffer of drive A:, not the one
+     * returned by 1217! Drive A: is corrupted/unusable after that.
+     * But if you pass letter of an uninitialized drive to 121f,
+     * then it returns error, no matter what 1217 returned.
+     * Also it seems to ignore the CDS of the drive letter passed
+     * to 121f. That letter is only put to new CDS, but the CDS
+     * associated with that letter is not looked up, so eg the
+     * flags are always initialized to 0x4000.
+     * This contradicts to what fdpp does, which is actually trying
+     * to re-create the CDS from the previous one.
+     * DR-DOS just hangs on that call.
+     * So the only reliable way is to pass uninitialized drive to
+     * 1217, then pass some valid drive to 121f (it will use the
+     * drive A: buffer in that case), and then patch the drive
+     * letter by hands, and not to use this with fdpp or drdos... */
+    if (cds == MK_FP32(_ES, _DI)) {
+      error("cds match\n");
+    } else {
+      /* fdpp puts size into CX but we can't hope on that */
+      MEMCPY_2UNIX(cds, SEGOFF2LINEAR(_ES, _DI), cds_record_size);
+      cds[0] = dosdrive + 'A';    // patch drive letter
+      ret = 1;
+    }
+  }
+
+  REGS = saved_regs;
+  return ret;
+}
+
+/*****************************
  * GetCDSInDOS
  * on entry:
  *   dosdrive: Dos Drive number (0=A, 1=B etc)
@@ -2578,9 +2638,19 @@ static int RedirectDisk(struct vm86_regs *state, int drive, char *resourceName)
   u_short DX = userStack[3];
   uint16_t ro_attrs = DX & 0b1111;
 
-  if (!GetCDSInDOS(drive, &cds)) {
+  if (!GetCDSInDOS(drive, &cds) || !cds) {
     SETWORD(&(state->eax), DISK_DRIVE_INVALID);
     return FALSE;
+  }
+  if (!cds[0]) {
+    int ret;
+    Debug0((dbg_fd, "building cds for drive %i\n", drive));
+    /* build new one from drive 2 (C:) */
+    ret = BuildCDSInDOS(drive, 2, cds);
+    if (!ret) {
+      error("error building CDS for drive %i\n", drive);
+      cds_flags(cds) = 0;    // try to continue
+    }
   }
 
   /* see if drive is already redirected or substituted */
